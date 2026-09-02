@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neon Air Drawing App</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #121212;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #ffffff;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        #canvas-container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        /* Mirror the video and canvas so it acts like a proper mirror */
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 640px;
+            height: 480px;
+            transform: scaleX(-1);
+        }
+
+        video {
+            opacity: 0.15; /* Subdued background webcam feed */
+            z-index: 1;
+            background: #000;
+        }
+
+        #drawingCanvas {
+            z-index: 2;
+            background: transparent;
+        }
+
+        /* Controls Panel */
+        #controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 12px 24px;
+            border-radius: 30px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            z-index: 10;
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        label {
+            font-size: 14px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }
+
+        input[type="color"] {
+            border: none;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            cursor: pointer;
+            background: none;
+        }
+
+        input[type="range"] {
+            accent-color: #00ffff;
+            cursor: pointer;
+        }
+
+        #status {
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 14px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .status-draw { color: #00ff88; box-shadow: 0 0 10px rgba(0,255,136,0.2); }
+        .status-erase { color: #ff3366; box-shadow: 0 0 10px rgba(255,51,102,0.2); }
+        .status-pause { color: #ffbb00; box-shadow: 0 0 10px rgba(255,187,0,0.2); }
+        .status-loading { color: #00ffff; }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="drawingCanvas" width="640" height="480"></canvas>
+    </div>
+
+    <div id="controls">
+        <div class="control-group">
+            <label for="colorPicker">Color:</label>
+            <input type="color" id="colorPicker" value="#00ffff">
+        </div>
+        
+        <div class="control-group">
+            <label for="brushThickness">Size:</label>
+            <input type="range" id="brushThickness" min="2" max="25" value="8">
+        </div>
+
+        <div class="control-group">
+            <span>Mode:</span>
+            <span id="status" class="status-loading">Loading Models...</span>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('drawingCanvas');
+        const ctx = canvasElement.getContext('2d');
+        const statusElement = document.getElementById('status');
+        const colorPicker = document.getElementById('colorPicker');
+        const brushThickness = document.getElementById('brushThickness');
+
+        let lastX = null;
+        let lastY = null;
+
+        // Configuration settings for gesture thresholds
+        const CLOSE_DISTANCE_THRESHOLD = 0.04; 
+
+        // Helper to calculate Euclidean distance between two MediaPipe landmarks
+        function getDistance(pt1, pt2) {
+            return Math.sqrt(Math.pow(pt1.x - pt2.x, 2) + Math.pow(pt1.y - pt2.y, 2));
+        }
+
+        function onResults(results) {
+            // Update baseline layout behavior when loaded
+            if(statusElement.innerText === "LOADING MODELS...") {
+                statusElement.innerText = "NO HAND DETECTED";
+                statusElement.className = "status-pause";
+            }
+
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                lastX = null;
+                lastY = null;
+                return;
+            }
+
+            const landmarks = results.multiHandLandmarks[0];
+
+            // 1. Identify specific landmark nodes
+            const wrist = landmarks[0];
+            const indexTip = landmarks[8];
+            const indexPip = landmarks[6];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+
+            // 2. Map normalized index finger coordinates directly to the canvas scale
+            const x = indexTip.x * canvasElement.width;
+            const y = indexTip.y * canvasElement.height;
+
+            // 3. Evaluate distances to determine hand state configurations
+            const isIndexExtended = indexTip.y < indexPip.y;
+            const isMiddleExtended = middleTip.y < landmarks[10].y;
+            const isRingExtended = ringTip.y < landmarks[14].y;
+            const isPinkyExtended = pinkyTip.y < landmarks[18].y;
+
+            // State Logic Assessments
+            let currentState = "pause";
+
+            if (isIndexExtended && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                currentState = "draw";
+            } else if (isIndexExtended && isMiddleExtended && isRingExtended && isPinkyExtended) {
+                currentState = "erase";
+            } else if (!isIndexExtended && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                currentState = "pause";
+            }
+
+            // 4. Execute action based on active state structure
+            if (currentState === "draw") {
+                statusElement.innerText = "Drawing";
+                statusElement.className = "status-draw";
+
+                if (lastX !== null && lastY !== null) {
+                    ctx.beginPath();
+                    ctx.moveTo(lastX, lastY);
+                    ctx.lineTo(x, y);
+                    
+                    // Setup Neon Glow properties
+                    ctx.strokeStyle = colorPicker.value;
+                    ctx.lineWidth = brushThickness.value;
+                    ctx.lineCap = 'round';
+                    ctx.lineJoin = 'round';
+                    ctx.shadowColor = colorPicker.value;
+                    ctx.shadowBlur = parseInt(brushThickness.value) * 1.5;
+                    
+                    ctx.stroke();
+                }
+                lastX = x;
+                lastY = y;
+
+            } else if (currentState === "erase") {
+                statusElement.innerText = "Erasing";
+                statusElement.className = "status-erase";
+                
+                // Clear an area contextually anchored around the index finger coordinate
+                ctx.save();
+                ctx.shadowBlur = 0; // Turn off glow effects dynamically for proper erasing paths
+                ctx.clearRect(x - 25, y - 25, 50, 50);
+                ctx.restore();
+                
+                lastX = null;
+                lastY = null;
+
+            } else {
+                statusElement.innerText = "Paused";
+                statusElement.className = "status-pause";
+                lastX = null;
+                lastY = null;
+            }
+        }
+
+        // Initialize MediaPipe Hands logic
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults(onResults);
+
+        // Track and process raw camera stream structure
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+        
+        camera.start();
+    </script>
+</body>
+</html>
